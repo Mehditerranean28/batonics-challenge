@@ -1,0 +1,39 @@
+# Cargo.toml
+[package]
+name = "batonics-challenge"
+version = "0.9.0"
+edition = "2021"
+
+[lib]
+name = "batonics_challenge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "batonics-challenge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["ws"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+hashbrown = "0.14"
+itoa = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "fs", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dbn = "0.45"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

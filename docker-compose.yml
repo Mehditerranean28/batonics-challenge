@@ -1,0 +1,38 @@
+# docker-compose.yml
+services:
+  replay:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["replay", "--bind", "0.0.0.0:9000", "--file", "/data/feed.bin", "--chunk", "1048576", "--max-bps", "0"]
+    volumes:
+      - ./data:/data:ro
+    ports:
+      - "9000:9000"
+
+  engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command:
+      [
+        "run",
+        "--connect",
+        "replay:9000",
+        "--http-bind",
+        "0.0.0.0:8080",
+        "--out",
+        "/data/final_snapshot.json",
+        "--depth",
+        "50",
+        "--snapshot-every-n",
+        "250000",
+        "--snapshot-interval-ms",
+        "250"
+      ]
+    depends_on:
+      - replay
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"
