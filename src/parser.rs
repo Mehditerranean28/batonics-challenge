@@ -32,11 +32,24 @@ pub struct SymbolIntern {
 
 impl SymbolIntern {
     pub fn new(names: Arc<RwLock<Vec<String>>>) -> Self {
-        Self {
-            names,
-            name_to_id: HashMap::new(),
-            instrument_to_id: HashMap::new(),
+        let mut name_to_id = HashMap::new();
+        let mut instrument_to_id = HashMap::new();
+
+        // Seed maps from existing names to prevent duplicates on reconnect
+        {
+            let r = names.read().unwrap();
+            for (i, n) in r.iter().enumerate() {
+                let id = i as u32;
+                name_to_id.insert(n.clone(), id);
+                if let Some(rest) = n.strip_prefix("inst:") {
+                    if let Ok(inst) = rest.parse::<u32>() {
+                        instrument_to_id.insert(inst, id);
+                    }
+                }
+            }
         }
+
+        Self { names, name_to_id, instrument_to_id }
     }
 
     pub fn intern_name(&mut self, name: &str) -> SymbolId {
@@ -138,17 +151,18 @@ impl Parser {
         let mut br = BufReader::new(r);
         let mut line = String::new();
 
-        while br.read_line(&mut line)? != 0 {
-            let s = line.trim();
+        loop {
+            line.clear(); // clear first to fix borrow checker issue
+            if br.read_line(&mut line)? == 0 {
+                break;
+            }
 
+            let s = line.trim();
             if s.is_empty() {
-                line.clear();
                 continue;
             }
 
             let op: NdjsonOp = serde_json::from_str(s)?;
-
-            line.clear(); // safe now (we're done using `s`)
 
             match op {
                 NdjsonOp::Add { symbol, side, oid, px, qty, seq, ts_ns } => {

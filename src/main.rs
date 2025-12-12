@@ -22,7 +22,7 @@ use std::{
     cell::RefCell,
     fs::File,
     io::{BufReader, Read},
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -32,8 +32,8 @@ use std::{
 };
 use tokio::{
     fs as tokio_fs,
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::AsyncWriteExt,
+    net::TcpListener,
     sync::{mpsc, watch},
 };
 use tracing::{error, info};
@@ -43,6 +43,16 @@ use batonics_challenge::{
     parser::{Parser, SymbolId, SymbolIntern, WireMode},
     wire,
 };
+// Performance tuning constants
+
+// Performance tuning constants
+const CHANNEL_BUFFER_SIZE: usize = 32_768;
+const INITIAL_ORDER_CAPACITY: usize = 250_000;
+const BUFFER_SIZE_1MB: usize = 1 << 20;
+const FILE_HEADER_SIZE: usize = 4096;
+const WS_PING_INTERVAL_SECS: u64 = 15;
+const TCP_BACKOFF_BASE: u64 = 2;
+
 use crate::metrics::Metrics;
 
 #[derive(ClapParser, Debug)]
@@ -66,7 +76,7 @@ enum Cmd {
     },
     Run {
         #[arg(long)]
-        connect: Option<SocketAddr>,
+        connect: Option<String>,
         #[arg(long)]
         file: Option<PathBuf>,
         #[arg(long, default_value = "0.0.0.0:8080")]
@@ -91,6 +101,9 @@ enum Cmd {
         /// TCP reconnect backoff max (ms).
         #[arg(long, default_value_t = 1000)]
         reconnect_max_ms: u64,
+        /// Exit after one clean TCP stream end (prevents infinite reconnect loops)
+        #[arg(long, default_value_t = false)]
+        once: bool,
     },
 }
 
@@ -177,6 +190,7 @@ async fn main() -> Result<()> {
             snapshot_every_n,
             reconnect_min_ms,
             reconnect_max_ms,
+            once,
         } => {
             run_engine(
                 connect,
@@ -189,6 +203,7 @@ async fn main() -> Result<()> {
                 snapshot_every_n,
                 reconnect_min_ms,
                 reconnect_max_ms,
+                once,
             )
             .await
         }
@@ -296,7 +311,7 @@ async fn process_file_ndjson(
 
 
 async fn run_engine(
-    connect: Option<SocketAddr>,
+    connect: Option<String>,
     file: Option<PathBuf>,
     http_bind: SocketAddr,
     out: PathBuf,
@@ -306,6 +321,7 @@ async fn run_engine(
     snapshot_every_n: u64,
     reconnect_min_ms: u64,
     reconnect_max_ms: u64,
+    once: bool,
 ) -> Result<()> {
     if connect.is_none() && file.is_none() {
         return Err(anyhow!("need --connect OR --file"));
@@ -322,7 +338,7 @@ async fn run_engine(
 
         // sniff first bytes
         let mut f = File::open(&path).with_context(|| format!("open {:?}", path))?;
-        let mut head = [0u8; 4096];
+        let mut head = [0u8; FILE_HEADER_SIZE];
         let n = f.read(&mut head)?;
         let mode = Parser::detect_mode(&head[..n]);
 
@@ -381,12 +397,12 @@ async fn run_engine(
         Ok::<(), anyhow::Error>(())
     });
 
-    let (pub_tx, pub_rx) = mpsc::channel::<PubEvent>(32_768);
+    let (pub_tx, pub_rx) = mpsc::channel::<PubEvent>(CHANNEL_BUFFER_SIZE);
     let pub_task = tokio::spawn(publisher_loop(state.clone(), pub_rx));
 
     let mut shard_txs = Vec::with_capacity(shard_n);
     for shard_id in 0..shard_n {
-        let (tx, rx) = mpsc::channel::<ShardMsg>(32_768);
+        let (tx, rx) = mpsc::channel::<ShardMsg>(CHANNEL_BUFFER_SIZE);
         shard_txs.push(tx);
         tokio::spawn(shard_loop(
             shard_id,
@@ -406,6 +422,7 @@ async fn run_engine(
         metrics.clone(),
         reconnect_min_ms,
         reconnect_max_ms,
+        once,
     )
     .await?;
 
@@ -508,7 +525,7 @@ async fn ws_watch_loop(
                 if msg.is_empty() { continue; }
                 if socket.send(Message::Binary(msg.to_vec())).await.is_err() { break; }
             }
-            _ = tokio::time::sleep(Duration::from_secs(15)) => {
+            _ = tokio::time::sleep(Duration::from_secs(WS_PING_INTERVAL_SECS)) => {
                 if socket.send(Message::Ping(vec![])).await.is_err() { break; }
             }
         }
@@ -536,6 +553,8 @@ async fn publisher_loop(st: AppState, mut rx: mpsc::Receiver<PubEvent>) -> Resul
                     let frame = wire::encode_snapshot(symbol, seq, ts_ns, &bids, &asks);
                     let _ = st.snap_tx.send_replace(frame);
                 }
+                // Update the final_json for /book endpoint
+                *st.final_json.write().await = build_final_json(st.symbol_names.clone(), st.latest_levels.clone()).await.into();
                 st.metrics.inc_pub_snap();
             }
             PubEvent::Resync { seq, ts_ns } => {
@@ -588,7 +607,7 @@ async fn shard_loop(
             ShardMsg::Mbp10 { symbol, seq, ts_ns, mut bids, mut asks } => {
                 let e = st.entry(symbol).or_insert_with(|| {
                     let mut b = OrderBook::new();
-                    b.reserve_orders(250_000);
+                    b.reserve_orders(INITIAL_ORDER_CAPACITY);
                     SymState { book: b, ..Default::default() }
                 });
 
@@ -619,7 +638,7 @@ async fn shard_loop(
             ShardMsg::Mbo { symbol, op, seq, ts_ns } => {
                 let e = st.entry(symbol).or_insert_with(|| {
                     let mut b = OrderBook::new();
-                    b.reserve_orders(250_000);
+                    b.reserve_orders(INITIAL_ORDER_CAPACITY);
                     SymState { book: b, ..Default::default() }
                 });
 
@@ -735,7 +754,7 @@ async fn process_file_dbn_fast(
                         metrics.inc_seq_gap();
                         s.books.entry(p.symbol).or_insert_with(|| {
                             let mut b = OrderBook::new();
-                            b.reserve_orders(250_000);
+                            b.reserve_orders(INITIAL_ORDER_CAPACITY);
                             b
                         }).clear();
                     }
@@ -744,7 +763,7 @@ async fn process_file_dbn_fast(
 
                 let book = s.books.entry(p.symbol).or_insert_with(|| {
                     let mut b = OrderBook::new();
-                    b.reserve_orders(250_000);
+                    b.reserve_orders(INITIAL_ORDER_CAPACITY);
                     b
                 });
 
@@ -798,28 +817,35 @@ async fn process_file_dbn_fast(
 }
 
 async fn process_tcp_with_reconnect(
-    connect: SocketAddr,
+    connect: String,
     symbol_names: Arc<RwLock<Vec<String>>>,
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     metrics: Arc<Metrics>,
     min_ms: u64,
     max_ms: u64,
+    once: bool,
 ) -> Result<()> {
     let shard_n = shard_txs.len().max(1);
     let mut backoff = min_ms.max(1);
     let max_ms = max_ms.max(backoff);
 
     loop {
-        let connect = connect;
+        let connect = connect.clone();
         let symbol_names = symbol_names.clone();
         let shard_txs = shard_txs.clone();
         let metrics = metrics.clone();
 
         let res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let sock = std::net::TcpStream::connect(connect).with_context(|| format!("connect {connect}"))?;
+            // Resolve hostname to SocketAddr
+            let mut addrs = connect.to_socket_addrs()
+                .with_context(|| format!("resolve {connect}"))?;
+            let addr = addrs.next().ok_or_else(|| anyhow!("no addr for {connect}"))?;
+
+            let sock = std::net::TcpStream::connect(addr)
+                .with_context(|| format!("connect {connect} -> {addr}"))?;
             sock.set_nodelay(true).ok();
 
-            let mut rd = BufReader::with_capacity(1 << 20, sock);
+            let mut rd = BufReader::with_capacity(BUFFER_SIZE_1MB, sock);
 
             // Read 4 bytes for mode check; then chain back into reader.
             let mut hdr = [0u8; 4];
@@ -865,7 +891,10 @@ async fn process_tcp_with_reconnect(
         match res {
             Ok(Ok(())) => {
                 backoff = min_ms.max(1);
-                info!("input(tcp): stream ended cleanly; reconnecting");
+                info!("input(tcp): stream ended cleanly{}", if once { "; exiting due to --once" } else { "; reconnecting" });
+                if once {
+                    return Ok(()); // Exit instead of reconnecting
+                }
             }
             Ok(Err(e)) => {
                 error!("input(tcp): error: {e:#}");
@@ -876,7 +905,7 @@ async fn process_tcp_with_reconnect(
         }
 
         tokio::time::sleep(Duration::from_millis(backoff)).await;
-        backoff = (backoff * 2).min(max_ms);
+        backoff = (backoff * TCP_BACKOFF_BASE).min(max_ms);
         metrics.inc_seq_gap();
     }
 }
