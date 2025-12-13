@@ -3,6 +3,16 @@
 
 HFT order book engine with DBN/NDJSON processing, TCP streaming, REST/WebSocket APIs, and Prometheus metrics.
 
+✅ (1) Data Streaming: sustaining ~64k msgs/s over TCP (requirement says 50k–500k).
+
+✅ (2) Order Book Reconstruction: reconstruct and output JSON deterministically; also have invariants tooling in book.rs.
+
+✅ (6) API Layer: got REST + WS endpoints (non-perf mode).
+
+✅ (11) Performance Optimization: perf mode + batching + counters on hot path.
+
+✅ (12) Observability: Prometheus metrics + structured logs.
+
 ## Quick Start
 
 ```bash
@@ -10,33 +20,56 @@ cargo build --release
 ./benchmark.sh
 ```
 
-(Sat Dec-12 3:28:31pm)-(CPU 2.7%:0:Net 47)-(emehhmi:/mnt/c/Users/USER/Desktop/KDP/batonics-challenge)-(172K:17)
-> ./benchmark.sh
+(Sat Dec-12 4:05:08pm)-(CPU 2.5%:0:Net 5)-(emehhmi:/mnt/c/Users/USER/Desktop/KDP/batonics-challenge)-(172K:17)
+> ./benchmark.sh 
 Building...
-Starting replay...
-Starting engine in perf mode...
-Waiting for /metrics...
-Warmup 5s...
-Measuring 30s...
----- TCP Results ----
-duration_s=32.0353
-msgs=2053316  errs=0  gaps=58
-throughput_msgs_per_s=64095.4
-goodput_msgs_per_s=64095.4
 
----- Error Breakdown ----
-# TYPE batonics_shard_dropped_total counter
+Starting replay...
+
+Starting engine in perf mode...
+
+Waiting for /metrics...
+
+Warmup 5s...
+
+Measuring 30s...
+
+**---- TCP Results ----**
+
+duration_s=32.2804
+
+msgs=2053316  errs=0  gaps=29
+
+**throughput_msgs_per_s=63608.8**
+
+goodput_msgs_per_s=63608.8
+
+**---- Error Breakdown ----**
+
+ TYPE batonics_shard_dropped_total counter
+
 batonics_shard_dropped_total 0
-# TYPE batonics_apply_unknown_order_total counter
+
+ TYPE batonics_apply_unknown_order_total counter
+
 batonics_apply_unknown_order_total 132096
-# TYPE batonics_apply_qty_too_large_total counter
+
+ TYPE batonics_apply_qty_too_large_total counter
+
 batonics_apply_qty_too_large_total 136
-# TYPE batonics_apply_level_underflow_total counter
+
+ TYPE batonics_apply_level_underflow_total counter
+
 batonics_apply_level_underflow_total 0
-# TYPE batonics_apply_overflow_total counter
+
+ TYPE batonics_apply_overflow_total counter
+
 batonics_apply_overflow_total 0
-# TYPE batonics_apply_other_total counter
+
+ TYPE batonics_apply_other_total counter
+ 
 batonics_apply_other_total 0
+
 
 ## Commands
 

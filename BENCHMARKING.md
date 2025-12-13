@@ -35,10 +35,6 @@ heaptrack ./target/release/batonics-challenge run --file data/feed.bin
 # Build and run full benchmark suite
 docker-compose up --build
 
-# Or run individual components
-docker run --rm -v $(pwd)/data:/data batonics-challenge \
-  run --file /data/feed.bin --depth 10
-
 # Monitor metrics in Docker
 docker run --rm --network host curlimages/curl \
   http://localhost:8080/metrics

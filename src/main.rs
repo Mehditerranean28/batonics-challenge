@@ -1,6 +1,7 @@
 // src/main.rs
 mod metrics;
 
+use tokio::sync::mpsc::error::TryRecvError;
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{
@@ -53,6 +54,11 @@ const WS_PING_INTERVAL_SECS: u64 = 15;
 const TCP_BACKOFF_BASE: u64 = 2;
 
 use crate::metrics::Metrics;
+
+#[inline(always)]
+fn shard_for(symbol: SymbolId, shard_n: usize) -> usize {
+    ((symbol.wrapping_mul(2654435761)) as usize) % shard_n
+}
 
 #[derive(ClapParser, Debug)]
 #[command(name = "batonics-challenge", version)]
@@ -607,14 +613,8 @@ async fn shard_loop(
         Some(Duration::from_millis(snapshot_interval_ms))
     };
 
-    // Slightly better distribution than simple modulo when symbol ids are clustered/sequential.
-    // (Still stable: same symbol -> same shard.)
-    #[inline(always)]
-    fn shard_for(symbol: SymbolId, shard_n: usize) -> usize {
-        ((symbol.wrapping_mul(2654435761)) as usize) % shard_n
-    }
-
     let mut handle = |m: ShardMsg| {
+        metrics.inc_total();
         msg_count += 1;
 
         match m {
@@ -707,9 +707,6 @@ async fn shard_loop(
                     metrics.record_engine(t0.elapsed());
                     r
                 };
-                if perf_mode {
-                    metrics.inc_total();
-                }
 
                 if state.book.is_crossed() {
                     metrics.inc_crossed_book();
@@ -792,14 +789,24 @@ async fn shard_loop(
 
     while let Some(m) = rx.recv().await {
         handle(m);
-        
-        // Simple batch drain - no starvation checks needed
-        let mut count = 0;
-        while count < 2048 {
+        // Batch drain reduces scheduler overhead. Keep fairness with a bounded drain + yield.
+        let batch_size = if perf_mode { 4096 } else { 512 };
+        let mut drained = 0usize;
+        while drained < batch_size {
             match rx.try_recv() {
-                Ok(m2) => { handle(m2); count += 1; }
-                Err(_) => break,
+                Ok(m2) => {
+                    handle(m2);
+                    drained += 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    info!("shard[{shard_id}] channel disconnected");
+                    return;
+                }
             }
+        }
+        if drained == batch_size {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -969,7 +976,7 @@ async fn process_tcp_with_reconnect(
                 &mut syms,
                 |p| {
                     metrics_clone.inc_total();
-                    let shard = (p.symbol as usize) % shard_n;
+                    let shard = shard_for(p.symbol, shard_n);
                     let msg = ShardMsg::Mbo {
                         symbol: p.symbol,
                         op: p.op,
@@ -981,8 +988,10 @@ async fn process_tcp_with_reconnect(
                     }
                 },
                 |symbol, seq, ts_ns, bids, asks| {
-                    metrics_clone.inc_total();
-                    let shard = (symbol as usize) % shard_n;
+                    if perf_mode {
+                        return;
+                    }
+                    let shard = shard_for(symbol, shard_n);
                     let msg = ShardMsg::Mbp10 {
                         symbol,
                         seq,
@@ -1007,18 +1016,20 @@ async fn process_tcp_with_reconnect(
                 if once {
                     return Ok(()); // Exit instead of reconnecting
                 }
+                metrics.inc_tcp_reconnect();
             }
             Ok(Err(e)) => {
                 error!("input(tcp): error: {e:#}");
+                metrics.inc_tcp_reconnect();
             }
             Err(e) => {
                 error!("input(tcp): join error: {e:#}");
+                metrics.inc_tcp_reconnect();
             }
         }
 
         tokio::time::sleep(Duration::from_millis(backoff)).await;
         backoff = (backoff * TCP_BACKOFF_BASE).min(max_ms);
-        metrics.inc_seq_gap();
     }
 }
 
