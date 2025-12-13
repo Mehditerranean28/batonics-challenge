@@ -47,7 +47,7 @@ use batonics_challenge::{
 // Performance tuning constants
 const CHANNEL_BUFFER_SIZE: usize = 32_768;
 const INITIAL_ORDER_CAPACITY: usize = 250_000;
-const BUFFER_SIZE_1MB: usize = 1 << 20;
+const BUFFER_SIZE_8MB: usize = 8 << 20;
 const FILE_HEADER_SIZE: usize = 4096;
 const WS_PING_INTERVAL_SECS: u64 = 15;
 const TCP_BACKOFF_BASE: u64 = 2;
@@ -103,6 +103,9 @@ enum Cmd {
         /// Exit after one clean TCP stream end (prevents infinite reconnect loops)
         #[arg(long, default_value_t = false)]
         once: bool,
+        /// Performance mode: disable HTTP, publishing, and non-essential work for max throughput
+        #[arg(long, default_value_t = false)]
+        perf_mode: bool,
     },
 }
 
@@ -173,6 +176,7 @@ async fn main() -> Result<()> {
             reconnect_min_ms,
             reconnect_max_ms,
             once,
+            perf_mode,
         } => {
             run_engine(
                 connect,
@@ -186,6 +190,7 @@ async fn main() -> Result<()> {
                 reconnect_min_ms,
                 reconnect_max_ms,
                 once,
+                perf_mode,
             )
             .await
         }
@@ -314,6 +319,7 @@ async fn run_engine(
     reconnect_min_ms: u64,
     reconnect_max_ms: u64,
     once: bool,
+    perf_mode: bool,
 ) -> Result<()> {
     if connect.is_none() && file.is_none() {
         return Err(anyhow!("need --connect OR --file"));
@@ -366,6 +372,7 @@ async fn run_engine(
     let (bbo_tx, bbo_rx) = watch::channel(Bytes::from_static(b""));
     let (snap_tx, snap_rx) = watch::channel(Bytes::from_static(b""));
 
+    // Always build state (metrics endpoint needs it)
     let state = AppState {
         metrics: metrics.clone(),
         symbol_names: symbol_names.clone(),
@@ -378,20 +385,36 @@ async fn run_engine(
         ws_snap_clients: Arc::new(AtomicUsize::new(0)),
     };
 
-    let api = build_api(state.clone());
-    let http_task = tokio::spawn(async move {
-        info!("http: listening on {http_bind}");
-        let listener = tokio::net::TcpListener::bind(http_bind).await?;
-        axum::serve(listener, api).await?;
-        Ok::<(), anyhow::Error>(())
-    });
+    // In perf_mode: run minimal HTTP (only /metrics), no publisher.
+    let http_task = {
+        let st = state.clone();
+        tokio::spawn(async move {
+            info!("http: listening on {http_bind}");
+            let app = if perf_mode {
+                Router::new().route("/metrics", get(metrics_handler)).with_state(st)
+            } else {
+                build_api(st)
+            };
+            let listener = tokio::net::TcpListener::bind(http_bind).await?;
+            axum::serve(listener, app).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    };
 
-    let (pub_tx, pub_rx) = mpsc::channel::<PubEvent>(CHANNEL_BUFFER_SIZE);
-    let pub_task = tokio::spawn(publisher_loop(state.clone(), pub_rx));
+    let (pub_tx, pub_task) = if perf_mode {
+        (None, None)
+    } else {
+        let (tx, rx) = mpsc::channel::<PubEvent>(CHANNEL_BUFFER_SIZE);
+        let task = tokio::spawn(publisher_loop(state.clone(), rx));
+        (Some(tx), Some(task))
+    };
+
+    // Bigger shard channels in perf mode to reduce drops/backpressure.
+    let shard_chan = if perf_mode { 131_072 } else { CHANNEL_BUFFER_SIZE };
 
     let mut shard_txs = Vec::with_capacity(shard_n);
     for shard_id in 0..shard_n {
-        let (tx, rx) = mpsc::channel::<ShardMsg>(CHANNEL_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel::<ShardMsg>(shard_chan);
         shard_txs.push(tx);
         tokio::spawn(shard_loop(
             shard_id,
@@ -402,6 +425,7 @@ async fn run_engine(
             depth,
             snapshot_interval_ms,
             snapshot_every_n,
+            perf_mode,
         ));
     }
 
@@ -413,10 +437,11 @@ async fn run_engine(
         reconnect_min_ms,
         reconnect_max_ms,
         once,
+        perf_mode,
     )
     .await?;
 
-    pub_task.abort();
+    if let Some(t) = pub_task { t.abort(); }
     http_task.abort();
     Ok(())
 }
@@ -556,12 +581,13 @@ async fn publisher_loop(st: AppState, mut rx: mpsc::Receiver<PubEvent>) -> Resul
 async fn shard_loop(
     shard_id: usize,
     mut rx: mpsc::Receiver<ShardMsg>,
-    pub_tx: mpsc::Sender<PubEvent>,
+    pub_tx: Option<mpsc::Sender<PubEvent>>,
     latest_levels: Arc<DashMap<SymbolId, SymbolLevels>>,
     metrics: Arc<Metrics>,
     depth: usize,
     snapshot_interval_ms: u64,
     snapshot_every_n: u64,
+    perf_mode: bool,
 ) {
     #[derive(Default)]
     struct SymState {
@@ -571,9 +597,7 @@ async fn shard_loop(
         needs_resync: bool,
     }
 
-    // Pre-allocate for direct indexing (assume max 10000 symbols)
-    const MAX_SYMBOLS: usize = 10000;
-    let mut books: Vec<Option<SymState>> = (0..MAX_SYMBOLS).map(|_| None).collect();
+    let mut books: Vec<Option<SymState>> = Vec::with_capacity(10_000);
     let mut msg_count: u64 = 0;
     let mut last_snap = Instant::now();
 
@@ -583,40 +607,66 @@ async fn shard_loop(
         Some(Duration::from_millis(snapshot_interval_ms))
     };
 
-    info!("shard[{shard_id}] started");
+    // Slightly better distribution than simple modulo when symbol ids are clustered/sequential.
+    // (Still stable: same symbol -> same shard.)
+    #[inline(always)]
+    fn shard_for(symbol: SymbolId, shard_n: usize) -> usize {
+        ((symbol.wrapping_mul(2654435761)) as usize) % shard_n
+    }
 
-    while let Some(m) = rx.recv().await {
+    let mut handle = |m: ShardMsg| {
         msg_count += 1;
 
         match m {
             ShardMsg::Mbp10 { symbol, seq, ts_ns, mut bids, mut asks } => {
-                let state = books[symbol as usize].get_or_insert_with(|| {
-                    let mut b = OrderBook::new();
-                    b.reserve_orders(INITIAL_ORDER_CAPACITY);
-                    SymState { book: b, ..Default::default() }
-                });
+                if perf_mode {
+                    return;
+                }
 
-                // MBP10 provides authoritative state
+                let idx = symbol as usize;
+                if idx >= books.len() {
+                    books.resize_with(idx + 1, || None);
+                }
+                // IMPORTANT: MBP10 is L2 snapshot data. Do NOT touch the L3 OrderBook.
+                // We keep per-symbol flags/seq, but do not clear/mutate the book.
+                let state = books[idx].get_or_insert_with(SymState::default);
+
+                // L2 snapshot observed (non-perf mode): publish/store only
                 state.last_seq = seq;
                 state.seen_mbp10 = true;
-                state.needs_resync = false; // Reset resync flag on authoritative state
-                state.book.clear(); // MBP10 authoritative; do not mix.
+                state.needs_resync = false;
 
                 if depth != 0 {
                     bids.truncate(depth);
                     asks.truncate(depth);
                 }
 
-                // Always update local state even if publisher queue drops.
                 let bids_arc: Arc<[LevelPxQty]> = bids.into();
                 let asks_arc: Arc<[LevelPxQty]> = asks.into();
-                latest_levels.insert(symbol, SymbolLevels { bids: bids_arc.clone(), asks: asks_arc.clone(), seq, ts_ns });
+                latest_levels.insert(
+                    symbol,
+                    SymbolLevels {
+                        bids: bids_arc.clone(),
+                        asks: asks_arc.clone(),
+                        seq,
+                        ts_ns,
+                    },
+                );
 
-                let bbo_frame = wire::encode_bbo(symbol, seq, ts_ns, bids_arc.first().map(|l| Some(l.px)).unwrap_or(None), bids_arc.first().map(|l| l.qty).unwrap_or(0), asks_arc.first().map(|l| Some(l.px)).unwrap_or(None), asks_arc.first().map(|l| l.qty).unwrap_or(0));
-                let snap_frame = wire::encode_snapshot(symbol, seq, ts_ns, &*bids_arc, &*asks_arc);
-                let _ = pub_tx.try_send(PubEvent::Bbo(bbo_frame));
-                let _ = pub_tx.try_send(PubEvent::Snapshot(snap_frame));
-                continue;
+                if let Some(tx) = pub_tx.as_ref() {
+                    let bbo_frame = wire::encode_bbo(
+                        symbol,
+                        seq,
+                        ts_ns,
+                        bids_arc.first().map(|l| l.px),
+                        bids_arc.first().map(|l| l.qty).unwrap_or(0),
+                        asks_arc.first().map(|l| l.px),
+                        asks_arc.first().map(|l| l.qty).unwrap_or(0),
+                    );
+                    let snap_frame = wire::encode_snapshot(symbol, seq, ts_ns, &*bids_arc, &*asks_arc);
+                    let _ = tx.try_send(PubEvent::Bbo(bbo_frame));
+                    let _ = tx.try_send(PubEvent::Snapshot(snap_frame));
+                }
             }
 
             ShardMsg::Mbo { symbol, op, seq, ts_ns } => {
@@ -630,71 +680,82 @@ async fn shard_loop(
                     SymState { book: b, ..Default::default() }
                 });
 
-                if seq != 0 {
-                    // Check for sequence issues: backwards = epoch reset, jumps = record but don't panic
-                    if state.last_seq != 0 && seq < state.last_seq {
-                        // Sequence went backwards (replay loop or reconnect) - reset
-                        metrics.inc_seq_gap();
-                        state.book.clear();
-                        state.seen_mbp10 = false;
-                        state.last_seq = seq;
-                    } else if state.last_seq != 0 && seq > state.last_seq + 1 {
-                        // Sequence jumped forward - record gap but don't clear state
-                        metrics.inc_seq_gap();
-                        state.last_seq = seq;
-                    } else {
-                        state.last_seq = seq;
-                    }
+                if !perf_mode && state.seen_mbp10 {
+                    // once L2 exists, ignore L3 to avoid double-counting
+                    return;
+                }
+                if state.needs_resync {
+                    return;
                 }
 
-                let t0 = Instant::now();
-                let out = state.book.apply(op);
-                metrics.record_engine(t0.elapsed());
-                metrics.inc_total();
+                if seq != 0 {
+                    if state.last_seq != 0 && seq < state.last_seq {
+                        metrics.inc_seq_gap();  // Real reset
+                        state.book.clear();
+                        state.seen_mbp10 = false;
+                    } else if state.last_seq != 0 && seq > state.last_seq + 1 {
+                        metrics.inc_seq_jump();   // Just a jump
+                    }
+                    state.last_seq = seq;
+                }
 
-                // Check for crossed book (bid >= ask) after apply - metric only, not error
+                let out = if perf_mode {
+                    state.book.apply(op)
+                } else {
+                    let t0 = Instant::now();
+                    let r = state.book.apply(op);
+                    metrics.record_engine(t0.elapsed());
+                    r
+                };
+                if perf_mode {
+                    metrics.inc_total();
+                }
+
                 if state.book.is_crossed() {
                     metrics.inc_crossed_book();
                 }
 
                 if out.err != ApplyError::None {
-                    // Break down error types for diagnostics
                     match out.err {
-                        batonics_challenge::book::ApplyError::UnknownOrder => {
-                            // UnknownOrder is normal feed behavior (missed adds, resets, etc.)
-                            // Count as drop, not error
-                            metrics.inc_apply_unknown_order();
-                        }
-                        batonics_challenge::book::ApplyError::QtyTooLarge => metrics.inc_apply_qty_too_large(),
-                        batonics_challenge::book::ApplyError::LevelUnderflow => {
+                        ApplyError::UnknownOrder => metrics.inc_apply_unknown_order(),
+                        ApplyError::QtyTooLarge => metrics.inc_apply_qty_too_large(),
+                        ApplyError::LevelUnderflow => {
                             metrics.inc_apply_level_underflow();
-                            metrics.inc_parse_err(); // Fatal invariant violation
+                            metrics.inc_parse_err();
                         }
-                        batonics_challenge::book::ApplyError::Overflow => {
+                        ApplyError::Overflow => {
                             metrics.inc_apply_overflow();
-                            metrics.inc_parse_err(); // Fatal invariant violation
+                            metrics.inc_parse_err();
                         }
                         _ => {
                             metrics.inc_apply_other();
-                            metrics.inc_parse_err(); // Unknown error type
+                            metrics.inc_parse_err();
                         }
                     }
 
-                    // Soft errors: drop the op but do not nuke state.
-                    // Fatal errors: state is inconsistent; resync.
                     if out.err.is_fatal() {
                         state.book.clear();
                         state.seen_mbp10 = false;
-                        let frame = wire::encode_resync(seq, ts_ns);
-                        let _ = pub_tx.try_send(PubEvent::Resync(frame));
+                        state.needs_resync = true;
+                        if let Some(tx) = pub_tx.as_ref() {
+                            let frame = wire::encode_resync(seq, ts_ns);
+                            let _ = tx.try_send(PubEvent::Resync(frame));
+                        }
                     }
-                    continue;
+                    return;
+                }
+
+                if perf_mode {
+                    return;
                 }
 
                 if out.bbo_changed {
-                    let b = state.book.bbo();
-                    let frame = wire::encode_bbo(symbol, seq, ts_ns, b.bid_px, b.bid_qty, b.ask_px, b.ask_qty);
-                    let _ = pub_tx.try_send(PubEvent::Bbo(frame));
+                    if let Some(tx) = pub_tx.as_ref() {
+                        let b = state.book.bbo();
+                        let frame =
+                            wire::encode_bbo(symbol, seq, ts_ns, b.bid_px, b.bid_qty, b.ask_px, b.ask_qty);
+                        let _ = tx.try_send(PubEvent::Bbo(frame));
+                    }
                 }
 
                 let mut do_snap = false;
@@ -711,14 +772,37 @@ async fn shard_loop(
                     last_snap = Instant::now();
                     let bids = state.book.levels_depth(Side::Bid, depth);
                     let asks = state.book.levels_depth(Side::Ask, depth);
-                    // Always update local state even if publisher queue drops.
-                    latest_levels.insert(symbol, SymbolLevels { bids: bids.clone().into(), asks: asks.clone().into(), seq, ts_ns });
-                    let frame = wire::encode_snapshot(symbol, seq, ts_ns, &bids, &asks);
-                    let _ = pub_tx.try_send(PubEvent::Snapshot(frame));
+                    latest_levels.insert(
+                        symbol,
+                        SymbolLevels {
+                            bids: bids.clone().into(),
+                            asks: asks.clone().into(),
+                            seq,
+                            ts_ns,
+                        },
+                    );
+                    if let Some(tx) = pub_tx.as_ref() {
+                        let frame = wire::encode_snapshot(symbol, seq, ts_ns, &bids, &asks);
+                        let _ = tx.try_send(PubEvent::Snapshot(frame));
+                    }
                 }
             }
         }
+    };
+
+    while let Some(m) = rx.recv().await {
+        handle(m);
+        
+        // Simple batch drain - no starvation checks needed
+        let mut count = 0;
+        while count < 2048 {
+            match rx.try_recv() {
+                Ok(m2) => { handle(m2); count += 1; }
+                Err(_) => break,
+            }
+        }
     }
+
     info!("shard[{shard_id}] stopped");
 }
 
@@ -842,10 +926,12 @@ async fn process_tcp_with_reconnect(
     min_ms: u64,
     max_ms: u64,
     once: bool,
+    perf_mode: bool,
 ) -> Result<()> {
     let shard_n = shard_txs.len().max(1);
     let mut backoff = min_ms.max(1);
     let max_ms = max_ms.max(backoff);
+    let perf_mode = perf_mode;
 
     loop {
         let connect = connect.clone();
@@ -863,7 +949,7 @@ async fn process_tcp_with_reconnect(
                 .with_context(|| format!("connect {connect} -> {addr}"))?;
             sock.set_nodelay(true).ok();
 
-            let mut rd = BufReader::with_capacity(BUFFER_SIZE_1MB, sock);
+            let mut rd = BufReader::with_capacity(BUFFER_SIZE_8MB, sock);
 
             // Peek 4 bytes for mode check without consuming
             let buf = rd.fill_buf()?;
@@ -882,6 +968,7 @@ async fn process_tcp_with_reconnect(
                 &mut rd,
                 &mut syms,
                 |p| {
+                    metrics_clone.inc_total();
                     let shard = (p.symbol as usize) % shard_n;
                     let msg = ShardMsg::Mbo {
                         symbol: p.symbol,
@@ -894,6 +981,7 @@ async fn process_tcp_with_reconnect(
                     }
                 },
                 |symbol, seq, ts_ns, bids, asks| {
+                    metrics_clone.inc_total();
                     let shard = (symbol as usize) % shard_n;
                     let msg = ShardMsg::Mbp10 {
                         symbol,

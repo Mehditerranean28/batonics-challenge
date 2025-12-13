@@ -10,19 +10,19 @@ cargo build --release
 ./benchmark.sh
 ```
 
-(Sat Dec-12 1:14:50am)-(CPU 3.9%:0:Net 5)-(emehhmi:/mnt/c/Users/USER/batonics-challenge)-(164K:17)
+(Sat Dec-12 3:28:31pm)-(CPU 2.7%:0:Net 47)-(emehhmi:/mnt/c/Users/USER/Desktop/KDP/batonics-challenge)-(172K:17)
 > ./benchmark.sh
 Building...
 Starting replay...
-Starting engine...
+Starting engine in perf mode...
 Waiting for /metrics...
 Warmup 5s...
 Measuring 30s...
 ---- TCP Results ----
-duration_s=33.6103
-msgs=1026658  errs=0  gaps=687735
-throughput_msgs_per_s=30545.9
-goodput_msgs_per_s=30545.9
+duration_s=32.0353
+msgs=2053316  errs=0  gaps=58
+throughput_msgs_per_s=64095.4
+goodput_msgs_per_s=64095.4
 
 ---- Error Breakdown ----
 # TYPE batonics_shard_dropped_total counter

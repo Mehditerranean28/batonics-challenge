@@ -7,9 +7,12 @@ pub struct Metrics {
     pub msgs_total: AtomicU64,
     pub msgs_parse_err: AtomicU64,
     pub msgs_seq_gap: AtomicU64,
+    pub msgs_seq_jump: AtomicU64,
     pub msgs_crossed_book: AtomicU64,
     pub pub_bbo: AtomicU64,
     pub pub_snap: AtomicU64,
+    pub seq_reset: AtomicU64,
+    pub seq_jump: AtomicU64,
     pub shard_dropped: AtomicU64,
     // ApplyError breakdown
     pub apply_unknown_order: AtomicU64,
@@ -41,7 +44,13 @@ impl Metrics {
     }
     #[inline]
     pub fn inc_seq_gap(&self) {
+        // "gap" == reset/rollback (seq went backwards)
         self.msgs_seq_gap.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_seq_jump(&self) {
+        // forward jump (seq > last+1) -- informational only
+        self.msgs_seq_jump.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
     pub fn inc_crossed_book(&self) {
@@ -108,6 +117,7 @@ impl Metrics {
         let total = self.msgs_total.load(Ordering::Relaxed);
         let perr = self.msgs_parse_err.load(Ordering::Relaxed);
         let gap = self.msgs_seq_gap.load(Ordering::Relaxed);
+        let jump = self.msgs_seq_jump.load(Ordering::Relaxed);
         let crossed = self.msgs_crossed_book.load(Ordering::Relaxed);
         let pb = self.pub_bbo.load(Ordering::Relaxed);
         let ps = self.pub_snap.load(Ordering::Relaxed);
@@ -132,6 +142,8 @@ batonics_msgs_total {total}
 batonics_msgs_parse_err_total {perr}
 # TYPE batonics_msgs_seq_gap_total counter
 batonics_msgs_seq_gap_total {gap}
+# TYPE batonics_msgs_seq_jump_total counter
+batonics_msgs_seq_jump_total {jump}
 # TYPE batonics_msgs_crossed_book_total counter
 batonics_msgs_crossed_book_total {crossed}
 # TYPE batonics_publish_bbo_total counter
