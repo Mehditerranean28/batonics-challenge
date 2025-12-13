@@ -56,7 +56,24 @@ impl SymbolIntern {
         if let Some(&id) = self.name_to_id.get(name) {
             return id;
         }
+
+        // Defensive dedupe: protect against duplicate inserts if multiple interners
+        // ever exist (reconnect cutovers, tests, future refactors).
+        // This is cold-path (first-seen symbol) so O(n) scan is acceptable.
+        if let Some(id) = {
+            let r = self.names.read().unwrap();
+            r.iter().position(|s| s == name).map(|i| i as u32)
+        } {
+            self.name_to_id.insert(name.to_owned(), id);
+            return id;
+        }
+
         let mut w = self.names.write().unwrap();
+        if let Some(id) = w.iter().position(|s| s == name).map(|i| i as u32) {
+            self.name_to_id.insert(name.to_owned(), id);
+            return id;
+        }
+
         let id = w.len() as u32;
         w.push(name.to_owned());
         self.name_to_id.insert(name.to_owned(), id);

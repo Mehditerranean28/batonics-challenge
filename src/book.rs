@@ -1,50 +1,4 @@
 // src/book.rs
-//! Order book implementation with high-performance price level management.
-//!
-//! This module provides a complete order book implementation optimized for low-latency
-//! market data processing. It supports all major order operations (add, cancel, modify,
-//! fill) and maintains efficient price-time priority.
-//!
-//! ## Key Features
-//!
-//! - **Efficient price levels**: Uses BTreeMap for O(log n) price level operations
-//! - **Order tracking**: HashMap-based order ID to order metadata mapping
-//! - **Memory pre-allocation**: Configurable order capacity for reduced allocations
-//! - **Invariant checking**: Comprehensive validation in debug/test builds
-//! - **Zero-cost abstractions**: Inline functions and optimized data structures
-//!
-//! ## Performance Characteristics
-//!
-//! - Add/Cancel/Modify: O(log P) where P is number of price levels
-//! - Fill: O(log P) for level updates
-//! - BBO access: O(1)
-//! - Memory usage: ~48 bytes per order + price level overhead
-//!
-//! ## Example
-//!
-//! ```rust
-//! use batonics_challenge::book::{OrderBook, Op, Side, ApplyError};
-//!
-//! let mut book = OrderBook::new();
-//! book.reserve_orders(1000); // Pre-allocate for performance
-//!
-//! // Add a bid order
-//! let op = Op::Add {
-//!     order_id: 1,
-//!     side: Side::Bid,
-//!     price: 10000, // $100.00 in cents
-//!     qty: 100,
-//! };
-//!
-//! let result = book.apply(op);
-//! assert_eq!(result.err, ApplyError::None);
-//! assert!(result.bbo_changed);
-//!
-//! // Check best bid/ask
-//! let bbo = book.bbo();
-//! assert_eq!(bbo.bid_px, Some(10000));
-//! assert_eq!(bbo.bid_qty, 100);
-//! ```
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -105,6 +59,26 @@ pub enum ApplyError {
     LevelUnderflow,
     Overflow,
     CrossedBook,
+}
+
+impl ApplyError {
+    /// Not all "errors" should nuke state.
+    ///
+    /// Real market feeds can legitimately contain cancels/fills for unknown orders
+    /// (sequencing differences, cutovers, partial resets). Treat those as soft drops.
+    /// Underflows/overflows indicate internal inconsistency -> must resync.
+    #[inline]
+    pub fn is_fatal(self) -> bool {
+        matches!(
+            self,
+            ApplyError::LevelUnderflow | ApplyError::Overflow
+        )
+    }
+
+    #[inline]
+    pub fn is_soft(self) -> bool {
+        self != ApplyError::None && !self.is_fatal()
+    }
 }
 
 impl Default for ApplyError {
@@ -172,6 +146,14 @@ impl OrderBook {
         }
     }
 
+    #[inline]
+    pub fn is_crossed(&self) -> bool {
+        match (self.best_bid, self.best_ask) {
+            (Some(bid), Some(ask)) => bid >= ask,
+            _ => false,
+        }
+    }
+
     #[inline(always)]
     fn recompute_best(&mut self, side: Side) {
         match side {
@@ -180,13 +162,7 @@ impl OrderBook {
         }
     }
 
-    #[inline(always)]
-    fn crossed(&self) -> bool {
-        match (self.best_bid, self.best_ask) {
-            (Some(b), Some(a)) => b >= a,
-            _ => false,
-        }
-    }
+
 
     #[inline(always)]
     fn level_add(&mut self, side: Side, px: i64, add: u64) -> Result<u64, ApplyError> {
@@ -427,9 +403,7 @@ impl OrderBook {
             }
         }
 
-        if err == ApplyError::None && self.crossed() {
-            err = ApplyError::CrossedBook;
-        }
+
 
         ApplyOut {
             bbo_changed: self.bbo() != prev,

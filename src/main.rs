@@ -21,7 +21,7 @@ use serde_json::json;
 use std::{
     cell::RefCell,
     fs::File,
-    io::{BufReader, Read},
+    io::{BufRead, BufReader, Read},
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::{
@@ -43,7 +43,6 @@ use batonics_challenge::{
     parser::{Parser, SymbolId, SymbolIntern, WireMode},
     wire,
 };
-// Performance tuning constants
 
 // Performance tuning constants
 const CHANNEL_BUFFER_SIZE: usize = 32_768;
@@ -118,39 +117,22 @@ struct AppState {
     snap_rx: watch::Receiver<Bytes>,
     ws_bbo_clients: Arc<AtomicUsize>,
     ws_snap_clients: Arc<AtomicUsize>,
-    final_json: Arc<tokio::sync::RwLock<Bytes>>,
 }
 
 #[derive(Clone, Debug)]
 struct SymbolLevels {
-    bids: Vec<LevelPxQty>,
-    asks: Vec<LevelPxQty>,
+    bids: Arc<[LevelPxQty]>,
+    asks: Arc<[LevelPxQty]>,
     seq: u64,
     ts_ns: u64,
 }
 
 #[derive(Debug)]
 enum PubEvent {
-    Bbo {
-        symbol: SymbolId,
-        seq: u64,
-        ts_ns: u64,
-        bid_px: Option<i64>,
-        bid_qty: u64,
-        ask_px: Option<i64>,
-        ask_qty: u64,
-    },
-    Snapshot {
-        symbol: SymbolId,
-        seq: u64,
-        ts_ns: u64,
-        bids: Vec<LevelPxQty>,
-        asks: Vec<LevelPxQty>,
-    },
-    Resync {
-        seq: u64,
-        ts_ns: u64,
-    },
+    /// Already-encoded frames (Bytes is ref-counted). Keep publisher lean.
+    Bbo(Bytes),
+    Snapshot(Bytes),
+    Resync(Bytes),
 }
 
 #[derive(Debug)]
@@ -221,17 +203,26 @@ async fn replay_server(bind: SocketAddr, file: PathBuf, chunk: usize, max_bps: u
         let buf = mmap.as_ref();
 
         let res = async {
-            let mut pos = 0usize;
-            let mut sent_this_sec: u64 = 0;
-            let mut window = Instant::now();
+            // For max performance (max_bps = 0), loop data continuously without closing
+            // Engine stays connected for sustained streaming
+            if max_bps == 0 {
+                loop {
+                    if sock.write_all(buf).await.is_err() {
+                        break; // Connection closed by client
+                    }
+                }
+            } else {
+                // Rate-limited mode: send once and close
+                let mut pos = 0usize;
+                let mut sent_this_sec: u64 = 0;
+                let mut window = Instant::now();
 
-            while pos < buf.len() {
-                let end = (pos + chunk).min(buf.len());
-                sock.write_all(&buf[pos..end]).await?;
-                let wrote = (end - pos) as u64;
-                pos = end;
+                while pos < buf.len() {
+                    let end = (pos + chunk).min(buf.len());
+                    sock.write_all(&buf[pos..end]).await?;
+                    let wrote = (end - pos) as u64;
+                    pos = end;
 
-                if max_bps > 0 {
                     sent_this_sec += wrote;
                     let elapsed = window.elapsed();
                     if elapsed >= Duration::from_secs(1) {
@@ -244,9 +235,8 @@ async fn replay_server(bind: SocketAddr, file: PathBuf, chunk: usize, max_bps: u
                         window = Instant::now();
                     }
                 }
+                sock.shutdown().await?;
             }
-
-            sock.shutdown().await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -288,7 +278,9 @@ async fn process_file_ndjson(
             let out = b.apply(p.op);
             if out.err != ApplyError::None {
                 metrics.inc_parse_err();
-                b.clear();
+                if out.err.is_fatal() {
+                    b.clear();
+                }
             }
         })?;
 
@@ -298,8 +290,8 @@ async fn process_file_ndjson(
             let asks = b.levels_depth(Side::Ask, depth);
             if bids.is_empty() && asks.is_empty() { continue; }
             snaps.insert(sym, SymbolLevels {
-                bids,
-                asks,
+                bids: bids.into(),
+                asks: asks.into(),
                 seq: *last_seq.get(&sym).unwrap_or(&0),
                 ts_ns: *last_ts.get(&sym).unwrap_or(&0),
             });
@@ -352,7 +344,7 @@ async fn run_engine(
             latest_levels.insert(sym, lvl);
         }
 
-        let final_text = build_final_json(symbol_names.clone(), latest_levels.clone()).await;
+        let final_text = build_final_json(&symbol_names, &latest_levels);
         tokio_fs::write(&out, final_text).await?;
         info!("wrote final snapshot to {:?}", out);
         return Ok(());
@@ -370,8 +362,6 @@ async fn run_engine(
     let metrics = Arc::new(Metrics::new());
     let symbol_names: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
     let latest_levels = Arc::new(DashMap::<SymbolId, SymbolLevels>::new());
-    let final_json =
-        Arc::new(tokio::sync::RwLock::new(Bytes::from_static(b"{\"symbols\":{},\"type\":\"final\"}")));
 
     let (bbo_tx, bbo_rx) = watch::channel(Bytes::from_static(b""));
     let (snap_tx, snap_rx) = watch::channel(Bytes::from_static(b""));
@@ -386,7 +376,6 @@ async fn run_engine(
         snap_rx,
         ws_bbo_clients: Arc::new(AtomicUsize::new(0)),
         ws_snap_clients: Arc::new(AtomicUsize::new(0)),
-        final_json: final_json.clone(),
     };
 
     let api = build_api(state.clone());
@@ -408,6 +397,7 @@ async fn run_engine(
             shard_id,
             rx,
             pub_tx.clone(),
+            latest_levels.clone(),
             metrics.clone(),
             depth,
             snapshot_interval_ms,
@@ -470,9 +460,10 @@ struct BookQuery {
 }
 
 async fn book_handler(State(st): State<AppState>, Query(q): Query<BookQuery>) -> impl IntoResponse {
+    // Build on-demand. Do not do global JSON rebuilds on the hot publish path.
     if q.symbol.is_none() {
-        let b = st.final_json.read().await.clone();
-        return (StatusCode::OK, b);
+        let s = build_final_json(&st.symbol_names, &st.latest_levels);
+        return (StatusCode::OK, Bytes::from(s));
     }
 
     let sym = q.symbol.unwrap();
@@ -487,8 +478,8 @@ async fn book_handler(State(st): State<AppState>, Query(q): Query<BookQuery>) ->
                 "symbol": sym,
                 "seq": v.seq,
                 "ts_ns": v.ts_ns,
-                "bids": v.bids,
-                "asks": v.asks
+                "bids": &*v.bids,
+                "asks": &*v.asks
             })
             .to_string();
             return (StatusCode::OK, Bytes::from(payload));
@@ -537,33 +528,23 @@ async fn ws_watch_loop(
 async fn publisher_loop(st: AppState, mut rx: mpsc::Receiver<PubEvent>) -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
-            PubEvent::Bbo { symbol, seq, ts_ns, bid_px, bid_qty, ask_px, ask_qty } => {
+            PubEvent::Bbo(frame) => {
                 if st.ws_bbo_clients.load(Ordering::Relaxed) != 0 {
-                    let frame = wire::encode_bbo(symbol, seq, ts_ns, bid_px, bid_qty, ask_px, ask_qty);
                     let _ = st.bbo_tx.send_replace(frame);
                 }
                 st.metrics.inc_pub_bbo();
             }
-            PubEvent::Snapshot { symbol, seq, ts_ns, bids, asks } => {
-                st.latest_levels.insert(
-                    symbol,
-                    SymbolLevels { bids: bids.clone(), asks: asks.clone(), seq, ts_ns },
-                );
+            PubEvent::Snapshot(frame) => {
                 if st.ws_snap_clients.load(Ordering::Relaxed) != 0 {
-                    let frame = wire::encode_snapshot(symbol, seq, ts_ns, &bids, &asks);
                     let _ = st.snap_tx.send_replace(frame);
                 }
-                // Update the final_json for /book endpoint
-                *st.final_json.write().await = build_final_json(st.symbol_names.clone(), st.latest_levels.clone()).await.into();
                 st.metrics.inc_pub_snap();
             }
-            PubEvent::Resync { seq, ts_ns } => {
+            PubEvent::Resync(frame) => {
                 if st.ws_snap_clients.load(Ordering::Relaxed) != 0 {
-                    let frame = wire::encode_resync(seq, ts_ns);
-                    let _ = st.snap_tx.send_replace(frame);
+                    let _ = st.snap_tx.send_replace(frame.clone());
                 }
                 if st.ws_bbo_clients.load(Ordering::Relaxed) != 0 {
-                    let frame = wire::encode_resync(seq, ts_ns);
                     let _ = st.bbo_tx.send_replace(frame);
                 }
             }
@@ -576,6 +557,7 @@ async fn shard_loop(
     shard_id: usize,
     mut rx: mpsc::Receiver<ShardMsg>,
     pub_tx: mpsc::Sender<PubEvent>,
+    latest_levels: Arc<DashMap<SymbolId, SymbolLevels>>,
     metrics: Arc<Metrics>,
     depth: usize,
     snapshot_interval_ms: u64,
@@ -586,9 +568,12 @@ async fn shard_loop(
         book: OrderBook,
         last_seq: u64,
         seen_mbp10: bool,
+        needs_resync: bool,
     }
 
-    let mut st: hashbrown::HashMap<SymbolId, SymState> = hashbrown::HashMap::new();
+    // Pre-allocate for direct indexing (assume max 10000 symbols)
+    const MAX_SYMBOLS: usize = 10000;
+    let mut books: Vec<Option<SymState>> = (0..MAX_SYMBOLS).map(|_| None).collect();
     let mut msg_count: u64 = 0;
     let mut last_snap = Instant::now();
 
@@ -605,82 +590,111 @@ async fn shard_loop(
 
         match m {
             ShardMsg::Mbp10 { symbol, seq, ts_ns, mut bids, mut asks } => {
-                let e = st.entry(symbol).or_insert_with(|| {
+                let state = books[symbol as usize].get_or_insert_with(|| {
                     let mut b = OrderBook::new();
                     b.reserve_orders(INITIAL_ORDER_CAPACITY);
                     SymState { book: b, ..Default::default() }
                 });
 
-                if seq != 0 && e.last_seq != 0 && seq != e.last_seq + 1 {
-                    metrics.inc_seq_gap();
-                    e.book.clear();
-                    e.seen_mbp10 = false;
-                    let _ = pub_tx.try_send(PubEvent::Resync { seq, ts_ns });
-                }
-
-                e.last_seq = seq;
-                e.seen_mbp10 = true;
-                e.book.clear(); // MBP10 authoritative; do not mix.
+                // MBP10 provides authoritative state
+                state.last_seq = seq;
+                state.seen_mbp10 = true;
+                state.needs_resync = false; // Reset resync flag on authoritative state
+                state.book.clear(); // MBP10 authoritative; do not mix.
 
                 if depth != 0 {
                     bids.truncate(depth);
                     asks.truncate(depth);
                 }
 
-                let (bid_px, bid_qty) = bids.first().map(|l| (Some(l.px), l.qty)).unwrap_or((None, 0));
-                let (ask_px, ask_qty) = asks.first().map(|l| (Some(l.px), l.qty)).unwrap_or((None, 0));
-                let _ = pub_tx.try_send(PubEvent::Bbo { symbol, seq, ts_ns, bid_px, bid_qty, ask_px, ask_qty });
+                // Always update local state even if publisher queue drops.
+                let bids_arc: Arc<[LevelPxQty]> = bids.into();
+                let asks_arc: Arc<[LevelPxQty]> = asks.into();
+                latest_levels.insert(symbol, SymbolLevels { bids: bids_arc.clone(), asks: asks_arc.clone(), seq, ts_ns });
 
-                let _ = pub_tx.try_send(PubEvent::Snapshot { symbol, seq, ts_ns, bids, asks });
+                let bbo_frame = wire::encode_bbo(symbol, seq, ts_ns, bids_arc.first().map(|l| Some(l.px)).unwrap_or(None), bids_arc.first().map(|l| l.qty).unwrap_or(0), asks_arc.first().map(|l| Some(l.px)).unwrap_or(None), asks_arc.first().map(|l| l.qty).unwrap_or(0));
+                let snap_frame = wire::encode_snapshot(symbol, seq, ts_ns, &*bids_arc, &*asks_arc);
+                let _ = pub_tx.try_send(PubEvent::Bbo(bbo_frame));
+                let _ = pub_tx.try_send(PubEvent::Snapshot(snap_frame));
                 continue;
             }
 
             ShardMsg::Mbo { symbol, op, seq, ts_ns } => {
-                let e = st.entry(symbol).or_insert_with(|| {
+                let idx = symbol as usize;
+                if idx >= books.len() {
+                    books.resize_with(idx + 1, || None);
+                }
+                let state = books[idx].get_or_insert_with(|| {
                     let mut b = OrderBook::new();
                     b.reserve_orders(INITIAL_ORDER_CAPACITY);
                     SymState { book: b, ..Default::default() }
                 });
 
-                if e.seen_mbp10 {
-                    // Once MBP10 exists for a symbol, ignore MBO to avoid double-counting.
-                    continue;
-                }
-
                 if seq != 0 {
-                    if e.last_seq != 0 && seq != e.last_seq + 1 {
+                    // Check for sequence issues: backwards = epoch reset, jumps = record but don't panic
+                    if state.last_seq != 0 && seq < state.last_seq {
+                        // Sequence went backwards (replay loop or reconnect) - reset
                         metrics.inc_seq_gap();
-                        e.book.clear();
-                        e.seen_mbp10 = false;
-                        let _ = pub_tx.try_send(PubEvent::Resync { seq, ts_ns });
+                        state.book.clear();
+                        state.seen_mbp10 = false;
+                        state.last_seq = seq;
+                    } else if state.last_seq != 0 && seq > state.last_seq + 1 {
+                        // Sequence jumped forward - record gap but don't clear state
+                        metrics.inc_seq_gap();
+                        state.last_seq = seq;
+                    } else {
+                        state.last_seq = seq;
                     }
-                    e.last_seq = seq;
                 }
 
                 let t0 = Instant::now();
-                let out = e.book.apply(op);
+                let out = state.book.apply(op);
                 metrics.record_engine(t0.elapsed());
                 metrics.inc_total();
 
+                // Check for crossed book (bid >= ask) after apply - metric only, not error
+                if state.book.is_crossed() {
+                    metrics.inc_crossed_book();
+                }
+
                 if out.err != ApplyError::None {
-                    metrics.inc_parse_err();
-                    e.book.clear();
-                    e.seen_mbp10 = false;
-                    let _ = pub_tx.try_send(PubEvent::Resync { seq, ts_ns });
+                    // Break down error types for diagnostics
+                    match out.err {
+                        batonics_challenge::book::ApplyError::UnknownOrder => {
+                            // UnknownOrder is normal feed behavior (missed adds, resets, etc.)
+                            // Count as drop, not error
+                            metrics.inc_apply_unknown_order();
+                        }
+                        batonics_challenge::book::ApplyError::QtyTooLarge => metrics.inc_apply_qty_too_large(),
+                        batonics_challenge::book::ApplyError::LevelUnderflow => {
+                            metrics.inc_apply_level_underflow();
+                            metrics.inc_parse_err(); // Fatal invariant violation
+                        }
+                        batonics_challenge::book::ApplyError::Overflow => {
+                            metrics.inc_apply_overflow();
+                            metrics.inc_parse_err(); // Fatal invariant violation
+                        }
+                        _ => {
+                            metrics.inc_apply_other();
+                            metrics.inc_parse_err(); // Unknown error type
+                        }
+                    }
+
+                    // Soft errors: drop the op but do not nuke state.
+                    // Fatal errors: state is inconsistent; resync.
+                    if out.err.is_fatal() {
+                        state.book.clear();
+                        state.seen_mbp10 = false;
+                        let frame = wire::encode_resync(seq, ts_ns);
+                        let _ = pub_tx.try_send(PubEvent::Resync(frame));
+                    }
                     continue;
                 }
 
                 if out.bbo_changed {
-                    let b = e.book.bbo();
-                    let _ = pub_tx.try_send(PubEvent::Bbo {
-                        symbol,
-                        seq,
-                        ts_ns,
-                        bid_px: b.bid_px,
-                        bid_qty: b.bid_qty,
-                        ask_px: b.ask_px,
-                        ask_qty: b.ask_qty,
-                    });
+                    let b = state.book.bbo();
+                    let frame = wire::encode_bbo(symbol, seq, ts_ns, b.bid_px, b.bid_qty, b.ask_px, b.ask_qty);
+                    let _ = pub_tx.try_send(PubEvent::Bbo(frame));
                 }
 
                 let mut do_snap = false;
@@ -695,14 +709,16 @@ async fn shard_loop(
 
                 if do_snap {
                     last_snap = Instant::now();
-                    let bids = e.book.levels_depth(Side::Bid, depth);
-                    let asks = e.book.levels_depth(Side::Ask, depth);
-                    let _ = pub_tx.try_send(PubEvent::Snapshot { symbol, seq, ts_ns, bids, asks });
+                    let bids = state.book.levels_depth(Side::Bid, depth);
+                    let asks = state.book.levels_depth(Side::Ask, depth);
+                    // Always update local state even if publisher queue drops.
+                    latest_levels.insert(symbol, SymbolLevels { bids: bids.clone().into(), asks: asks.clone().into(), seq, ts_ns });
+                    let frame = wire::encode_snapshot(symbol, seq, ts_ns, &bids, &asks);
+                    let _ = pub_tx.try_send(PubEvent::Snapshot(frame));
                 }
             }
         }
     }
-
     info!("shard[{shard_id}] stopped");
 }
 
@@ -770,7 +786,9 @@ async fn process_file_dbn_fast(
                 let out = book.apply(p.op);
                 if out.err != ApplyError::None {
                     metrics.inc_parse_err();
-                    book.clear();
+                    if out.err.is_fatal() {
+                        book.clear();
+                    }
                 }
             },
             |symbol, seq, ts_ns, mut bids, mut asks| {
@@ -789,7 +807,7 @@ async fn process_file_dbn_fast(
                 if replace {
                     s.snaps.insert(
                         symbol,
-                        SymbolLevels { bids, asks, seq, ts_ns },
+                        SymbolLevels { bids: bids.into(), asks: asks.into(), seq, ts_ns },
                     );
                 }
             },
@@ -808,7 +826,7 @@ async fn process_file_dbn_fast(
             }
             let seq = *s.last_seq.get(sym).unwrap_or(&0);
             let ts_ns = *s.last_ts.get(sym).unwrap_or(&0);
-            s.snaps.insert(*sym, SymbolLevels { bids, asks, seq, ts_ns });
+            s.snaps.insert(*sym, SymbolLevels { bids: bids.into(), asks: asks.into(), seq, ts_ns });
         }
 
         Ok(s.snaps)
@@ -833,7 +851,7 @@ async fn process_tcp_with_reconnect(
         let connect = connect.clone();
         let symbol_names = symbol_names.clone();
         let shard_txs = shard_txs.clone();
-        let metrics = metrics.clone();
+        let metrics_clone = metrics.clone();
 
         let res = tokio::task::spawn_blocking(move || -> Result<()> {
             // Resolve hostname to SocketAddr
@@ -847,40 +865,46 @@ async fn process_tcp_with_reconnect(
 
             let mut rd = BufReader::with_capacity(BUFFER_SIZE_1MB, sock);
 
-            // Read 4 bytes for mode check; then chain back into reader.
-            let mut hdr = [0u8; 4];
-            rd.read_exact(&mut hdr)?;
-            let mode = Parser::detect_mode(&hdr);
+            // Peek 4 bytes for mode check without consuming
+            let buf = rd.fill_buf()?;
+            if buf.len() < 4 {
+                return Err(anyhow!("tcp: stream too short for mode detection"));
+            }
+            let mode = Parser::detect_mode(&buf[..4]);
             if !matches!(mode, WireMode::Dbn) {
                 return Err(anyhow!("tcp: expected DBN stream, detected {mode:?}"));
             }
-
-            let cur = std::io::Cursor::new(hdr.to_vec());
-            let mut chained = std::io::Read::chain(cur, rd);
+            // Borrow ends here, rd can be used mutably
 
             let mut syms = SymbolIntern::new(symbol_names);
 
             Parser::dbn_decode_reader(
-                &mut chained,
+                &mut rd,
                 &mut syms,
                 |p| {
                     let shard = (p.symbol as usize) % shard_n;
-                    let _ = shard_txs[shard].blocking_send(ShardMsg::Mbo {
+                    let msg = ShardMsg::Mbo {
                         symbol: p.symbol,
                         op: p.op,
                         seq: p.seq,
                         ts_ns: p.ts_ns,
-                    });
+                    };
+                    if let Err(_) = shard_txs[shard].try_send(msg) {
+                        metrics_clone.inc_shard_dropped();
+                    }
                 },
                 |symbol, seq, ts_ns, bids, asks| {
                     let shard = (symbol as usize) % shard_n;
-                    let _ = shard_txs[shard].blocking_send(ShardMsg::Mbp10 {
+                    let msg = ShardMsg::Mbp10 {
                         symbol,
                         seq,
                         ts_ns,
                         bids,
                         asks,
-                    });
+                    };
+                    if let Err(_) = shard_txs[shard].try_send(msg) {
+                        metrics_clone.inc_shard_dropped();
+                    }
                 },
             )?;
 
@@ -910,9 +934,9 @@ async fn process_tcp_with_reconnect(
     }
 }
 
-async fn build_final_json(
-    symbol_names: Arc<RwLock<Vec<String>>>,
-    latest: Arc<DashMap<SymbolId, SymbolLevels>>,
+fn build_final_json(
+    symbol_names: &Arc<RwLock<Vec<String>>>,
+    latest: &Arc<DashMap<SymbolId, SymbolLevels>>,
 ) -> String {
     let ids = SymbolIntern::iter_ids_lex(&symbol_names);
     let names = symbol_names.read().unwrap();
@@ -926,8 +950,8 @@ async fn build_final_json(
                 json!({
                     "seq": v.seq,
                     "ts_ns": v.ts_ns,
-                    "bids": v.bids,
-                    "asks": v.asks
+                    "bids": &*v.bids,
+                    "asks": &*v.asks
                 }),
             );
         }

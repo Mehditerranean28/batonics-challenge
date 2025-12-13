@@ -1,9 +1,10 @@
 # docker-compose.yml
 services:
   replay:
+    image: batonics-challenge
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
     command: ["replay", "--bind", "0.0.0.0:9000", "--file", "/data/feed.bin", "--chunk", "1048576", "--max-bps", "0"]
     volumes:
       - ./data:/data:ro
@@ -11,9 +12,10 @@ services:
       - "9000:9000"
 
   engine:
+    image: batonics-challenge
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: Dockerfile
     command:
       [
         "run",
