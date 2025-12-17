@@ -283,9 +283,15 @@ async fn process_file_ndjson(
 
             if p.seq != 0 {
                 let prev = last_seq.get(&p.symbol).copied().unwrap_or(0);
-                if prev != 0 && p.seq != prev + 1 {
-                    metrics.inc_seq_gap();
-                    books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                if prev != 0 {
+                    if p.seq < prev {
+                        // real reset/rollback
+                        metrics.inc_seq_gap();
+                        books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                    } else if p.seq > prev + 1 {
+                        // forward jump (don't clear)
+                        metrics.inc_seq_jump();
+                    }
                 }
                 last_seq.insert(p.symbol, p.seq);
             }
@@ -337,9 +343,15 @@ async fn process_file_ndjson_feed(
 
             if p.seq != 0 {
                 let prev = last_seq.get(&p.symbol).copied().unwrap_or(0);
-                if prev != 0 && p.seq != prev + 1 {
-                    metrics.inc_seq_gap();
-                    books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                if prev != 0 {
+                    if p.seq < prev {
+                        // real reset/rollback
+                        metrics.inc_seq_gap();
+                        books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                    } else if p.seq > prev + 1 {
+                        // forward jump (don't clear)
+                        metrics.inc_seq_jump();
+                    }
                 }
                 last_seq.insert(p.symbol, p.seq);
             }
@@ -409,9 +421,15 @@ async fn process_file_dbn_feed(
                 let mut s = st.borrow_mut();
                 if p.seq != 0 {
                     let prev = s.last_seq.get(&p.symbol).copied().unwrap_or(0);
-                    if prev != 0 && p.seq != prev + 1 {
-                        metrics.inc_seq_gap();
-                        s.books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                    if prev != 0 {
+                        if p.seq < prev {
+                            // real reset/rollback
+                            metrics.inc_seq_gap();
+                            s.books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                        } else if p.seq > prev + 1 {
+                            // forward jump (don't clear)
+                            metrics.inc_seq_jump();
+                        }
                     }
                     s.last_seq.insert(p.symbol, p.seq);
                 }
@@ -1024,13 +1042,19 @@ async fn process_file_dbn_fast(
 
                 if p.seq != 0 {
                     let prev = s.last_seq.get(&p.symbol).copied().unwrap_or(0);
-                    if prev != 0 && p.seq != prev + 1 {
-                        metrics.inc_seq_gap();
-                        s.books.entry(p.symbol).or_insert_with(|| {
-                            let mut b = OrderBook::new();
-                            b.reserve_orders(INITIAL_ORDER_CAPACITY);
-                            b
-                        }).clear();
+                    if prev != 0 {
+                        if p.seq < prev {
+                            // real reset/rollback
+                            metrics.inc_seq_gap();
+                            s.books.entry(p.symbol).or_insert_with(|| {
+                                let mut b = OrderBook::new();
+                                b.reserve_orders(INITIAL_ORDER_CAPACITY);
+                                b
+                            }).clear();
+                        } else if p.seq > prev + 1 {
+                            // forward jump (don't clear)
+                            metrics.inc_seq_jump();
+                        }
                     }
                     s.last_seq.insert(p.symbol, p.seq);
                 }

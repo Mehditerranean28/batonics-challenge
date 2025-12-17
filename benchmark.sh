@@ -19,16 +19,21 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 echo "Building..."
-cargo build --release --quiet
+cargo build --release
 echo "Starting replay..."
 # STEP1
-timeout $((DUR+WARMUP+5)) ./target/release/batonics-challenge replay \
+./target/release/batonics-challenge replay \
   --bind "127.0.0.1:${REPLAY_PORT}" \
   --file data/feed.bin \
   --chunk "${CHUNK}" \
   --max-bps 2000000 >/dev/null 2>&1 &
 REPLAY_PID=$!
-sleep 0.5
+sleep 1
+# Check if replay server started successfully
+if ! kill -0 "${REPLAY_PID}" 2>/dev/null; then
+  echo "ERROR: Replay server failed to start"
+  exit 1
+fi
 echo "Starting engine in perf mode..."
 ./target/release/batonics-challenge run \
   --connect "127.0.0.1:${REPLAY_PORT}" \
@@ -37,11 +42,21 @@ echo "Starting engine in perf mode..."
   --snapshot-interval-ms 0 \
   --snapshot-every-n 0 >/dev/null 2>&1 &
 ENGINE_PID=$!
+# Check if engine started successfully
+sleep 0.5
+if ! kill -0 "${ENGINE_PID}" 2>/dev/null; then
+  echo "ERROR: Engine failed to start"
+  exit 1
+fi
 echo "Waiting for /metrics..."
-for _ in {1..100}; do
+for i in $(seq 1 100); do
   curl -sf "http://127.0.0.1:${ENGINE_PORT}/metrics" >/dev/null && break
   sleep 0.05
 done
+if ! curl -sf "http://127.0.0.1:${ENGINE_PORT}/metrics" >/dev/null; then
+  echo "ERROR: Metrics endpoint not available"
+  exit 1
+fi
 echo "Warmup ${WARMUP}s..."
 sleep "${WARMUP}"
 t0=$(date +%s%N)
