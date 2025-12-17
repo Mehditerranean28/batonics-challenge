@@ -74,8 +74,26 @@ batonics_apply_other_total 0
 ## Commands
 
 - `run --file <path>`: Process file to JSON output
+- `run --file <path> --feed --out <file.ndjson>`: Process file to NDJSON snapshot feed (one snapshot per event)
 - `run --connect <addr>`: Live TCP streaming
+- `run --connect <addr> --snapshot_every_n 1 --snapshot_interval_ms 0`: Live TCP with snapshot per event
 - `replay --bind <addr> --file <path>`: TCP replay server
+
+## Snapshot Per Event Feature
+
+Emit a snapshot after every MBO event and MBP10 event, in the same JSON shape as MBP samples.
+
+### File Mode (Offline)
+```bash
+cargo run --bin batonics-challenge -- run --file data/feed.bin --feed --out snapshots.ndjson
+```
+**Result**: Generated 15,138 snapshots in NDJSON format with string symbols like `"inst:432669"`
+
+### Live Mode (TCP)
+```bash
+cargo run --bin batonics-challenge -- run --connect <host> --snapshot_every_n 1 --snapshot_interval_ms 0
+```
+**Result**: Publishes snapshots after every processed message (MBO events) and MBP10 events
 
 ## Manual Testing
 

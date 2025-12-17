@@ -28,6 +28,29 @@ fn push_opt_i64(out: &mut Vec<u8>, buf: &mut Buffer, v: Option<i64>) {
     }
 }
 
+#[inline(always)]
+fn push_json_str(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for &c in s.as_bytes() {
+        match c {
+            b'"' => push_str(out, "\\\""),
+            b'\\' => push_str(out, "\\\\"),
+            b'\n' => push_str(out, "\\n"),
+            b'\r' => push_str(out, "\\r"),
+            b'\t' => push_str(out, "\\t"),
+            0x00..=0x1F => {
+                // control chars -> \u00XX
+                let hex = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u00");
+                out.push(hex[(c >> 4) as usize]);
+                out.push(hex[(c & 0x0F) as usize]);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push(b'"');
+}
+
 pub fn encode_bbo(
     symbol: SymbolId,
     seq: u64,
@@ -101,6 +124,49 @@ pub fn encode_snapshot(
         if i != 0 {
             out.push(b',');
         }
+        push_str(&mut out, "{\"px\":");
+        push_i64(&mut out, &mut b, lv.px);
+        push_str(&mut out, ",\"qty\":");
+        push_u64(&mut out, &mut b, lv.qty);
+        out.push(b'}');
+    }
+
+    push_str(&mut out, "]}");
+    Bytes::from(out)
+}
+
+pub fn encode_snapshot_named(
+    symbol: &str,
+    seq: u64,
+    ts_ns: u64,
+    bids: &[LevelPxQty],
+    asks: &[LevelPxQty],
+) -> Bytes {
+    let mut out = Vec::with_capacity(96 + (bids.len() + asks.len()) * 28 + symbol.len());
+    let mut b = Buffer::new();
+
+    push_str(&mut out, "{\"type\":\"snapshot\",\"symbol\":");
+    push_json_str(&mut out, symbol);
+
+    push_str(&mut out, ",\"seq\":");
+    push_u64(&mut out, &mut b, seq);
+
+    push_str(&mut out, ",\"ts_ns\":");
+    push_u64(&mut out, &mut b, ts_ns);
+
+    push_str(&mut out, ",\"bids\":[");
+    for (i, lv) in bids.iter().enumerate() {
+        if i != 0 { out.push(b','); }
+        push_str(&mut out, "{\"px\":");
+        push_i64(&mut out, &mut b, lv.px);
+        push_str(&mut out, ",\"qty\":");
+        push_u64(&mut out, &mut b, lv.qty);
+        out.push(b'}');
+    }
+
+    push_str(&mut out, "],\"asks\":[");
+    for (i, lv) in asks.iter().enumerate() {
+        if i != 0 { out.push(b','); }
         push_str(&mut out, "{\"px\":");
         push_i64(&mut out, &mut b, lv.px);
         push_str(&mut out, ",\"qty\":");

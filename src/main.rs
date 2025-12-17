@@ -22,7 +22,7 @@ use serde_json::json;
 use std::{
     cell::RefCell,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, BufWriter, Write},
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::{
@@ -91,6 +91,9 @@ enum Cmd {
         /// Depth=0 means full depth (all price levels)
         #[arg(long, default_value_t = 50)]
         depth: usize,
+        /// In --file mode: write NDJSON snapshots (one per event) to --out instead of final JSON.
+        #[arg(long, default_value_t = false)]
+        feed: bool,
         /// Number of independent book shards (parallel symbol partitions).
         #[arg(long)]
         shards: Option<usize>,
@@ -176,6 +179,7 @@ async fn main() -> Result<()> {
             http_bind,
             out,
             depth,
+            feed,
             shards,
             snapshot_interval_ms,
             snapshot_every_n,
@@ -190,6 +194,7 @@ async fn main() -> Result<()> {
                 http_bind,
                 out,
                 depth,
+                feed,
                 shards,
                 snapshot_interval_ms,
                 snapshot_every_n,
@@ -312,6 +317,155 @@ async fn process_file_ndjson(
     }).await?
 }
 
+async fn process_file_ndjson_feed(
+    path: PathBuf,
+    out_path: PathBuf,
+    symbol_names: Arc<RwLock<Vec<String>>>,
+    metrics: Arc<Metrics>,
+    depth: usize,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let f = File::open(&path).with_context(|| format!("open {:?}", path))?;
+        let mut w = BufWriter::new(File::create(&out_path).with_context(|| format!("create {:?}", out_path))?);
+
+        let mut syms = SymbolIntern::new(symbol_names.clone());
+        let mut books: hashbrown::HashMap<SymbolId, OrderBook> = hashbrown::HashMap::new();
+        let mut last_seq: hashbrown::HashMap<SymbolId, u64> = hashbrown::HashMap::new();
+
+        Parser::ndjson_decode_reader(f, &mut syms, |p| {
+            metrics.inc_total();
+
+            if p.seq != 0 {
+                let prev = last_seq.get(&p.symbol).copied().unwrap_or(0);
+                if prev != 0 && p.seq != prev + 1 {
+                    metrics.inc_seq_gap();
+                    books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                }
+                last_seq.insert(p.symbol, p.seq);
+            }
+
+            let b = books.entry(p.symbol).or_insert_with(OrderBook::new);
+            let out_apply = b.apply(p.op);
+            if out_apply.err != ApplyError::None {
+                metrics.inc_parse_err();
+                if out_apply.err.is_fatal() {
+                    b.clear();
+                }
+                // still emit a snapshot? typically no; drop on fatal/soft errors.
+                return;
+            }
+
+            let bids = b.levels_depth(Side::Bid, depth);
+            let asks = b.levels_depth(Side::Ask, depth);
+
+            // resolve symbol name
+            let name = {
+                let r = symbol_names.read().unwrap();
+                r.get(p.symbol as usize).cloned().unwrap_or_default()
+            };
+
+            let frame = wire::encode_snapshot_named(&name, p.seq, p.ts_ns, &bids, &asks);
+            let _ = w.write_all(&frame);
+            let _ = w.write_all(b"\n");
+        })?;
+
+        w.flush()?;
+        Ok(())
+    }).await?
+}
+
+async fn process_file_dbn_feed(
+    path: PathBuf,
+    out_path: PathBuf,
+    symbol_names: Arc<RwLock<Vec<String>>>,
+    metrics: Arc<Metrics>,
+    depth: usize,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let f = File::open(&path).with_context(|| format!("open file {:?}", path))?;
+        let mmap = unsafe { Mmap::map(&f)? };
+        let bytes = mmap.as_ref();
+
+        let mode = Parser::detect_mode(bytes);
+        if !matches!(mode, WireMode::Dbn) {
+            return Err(anyhow!("file mode supports DBN only"));
+        }
+
+        let w = RefCell::new(BufWriter::new(File::create(&out_path).with_context(|| format!("create {:?}", out_path))?));
+        let mut syms = SymbolIntern::new(symbol_names.clone());
+
+        struct St {
+            books: hashbrown::HashMap<SymbolId, OrderBook>,
+            last_seq: hashbrown::HashMap<SymbolId, u64>,
+        }
+        let st = RefCell::new(St { books: hashbrown::HashMap::new(), last_seq: hashbrown::HashMap::new() });
+
+        Parser::dbn_decode_bytes(
+            bytes,
+            &mut syms,
+            |p| {
+                metrics.inc_total();
+
+                let mut s = st.borrow_mut();
+                if p.seq != 0 {
+                    let prev = s.last_seq.get(&p.symbol).copied().unwrap_or(0);
+                    if prev != 0 && p.seq != prev + 1 {
+                        metrics.inc_seq_gap();
+                        s.books.entry(p.symbol).or_insert_with(OrderBook::new).clear();
+                    }
+                    s.last_seq.insert(p.symbol, p.seq);
+                }
+
+                let book = s.books.entry(p.symbol).or_insert_with(|| {
+                    let mut b = OrderBook::new();
+                    b.reserve_orders(INITIAL_ORDER_CAPACITY);
+                    b
+                });
+
+                let out_apply = book.apply(p.op);
+                if out_apply.err != ApplyError::None {
+                    metrics.inc_parse_err();
+                    if out_apply.err.is_fatal() {
+                        book.clear();
+                    }
+                    return;
+                }
+
+                let bids = book.levels_depth(Side::Bid, depth);
+                let asks = book.levels_depth(Side::Ask, depth);
+
+                let name = {
+                    let r = symbol_names.read().unwrap();
+                    r.get(p.symbol as usize).cloned().unwrap_or_default()
+                };
+
+                let frame = wire::encode_snapshot_named(&name, p.seq, p.ts_ns, &bids, &asks);
+                let _ = w.borrow_mut().write_all(&frame);
+                let _ = w.borrow_mut().write_all(b"\n");
+            },
+            |symbol, seq, ts_ns, mut bids, mut asks| {
+                // MBP10 is already a snapshot event: emit directly.
+                if depth != 0 {
+                    bids.truncate(depth);
+                    asks.truncate(depth);
+                }
+
+                let name = {
+                    let r = symbol_names.read().unwrap();
+                    r.get(symbol as usize).cloned().unwrap_or_default()
+                };
+
+                let frame = wire::encode_snapshot_named(&name, seq, ts_ns, &bids, &asks);
+                let _ = w.borrow_mut().write_all(&frame);
+                let _ = w.borrow_mut().write_all(b"\n");
+            },
+        )?;
+
+        w.into_inner().flush()?;
+        Ok(())
+    }).await?
+}
+
 
 async fn run_engine(
     connect: Option<String>,
@@ -319,6 +473,7 @@ async fn run_engine(
     http_bind: SocketAddr,
     out: PathBuf,
     depth: usize,
+    feed: bool,
     shards: Option<usize>,
     snapshot_interval_ms: u64,
     snapshot_every_n: u64,
@@ -346,6 +501,18 @@ async fn run_engine(
         let n = f.read(&mut head)?;
         let mode = Parser::detect_mode(&head[..n]);
 
+        if feed {
+            // stream NDJSON snapshots to `out`
+            match mode {
+                WireMode::Dbn => process_file_dbn_feed(path.clone(), out.clone(), symbol_names.clone(), metrics.clone(), depth).await?,
+                WireMode::Ndjson => process_file_ndjson_feed(path.clone(), out.clone(), symbol_names.clone(), metrics.clone(), depth).await?,
+                _ => return Err(anyhow!("file mode supports DBN or NDJSON; detected {mode:?}")),
+            }
+            info!("wrote snapshot feed to {:?}", out);
+            return Ok(());
+        }
+
+        // existing final snapshot behavior
         let snaps = match mode {
             WireMode::Dbn => process_file_dbn_fast(path.clone(), symbol_names.clone(), metrics.clone(), depth).await?,
             WireMode::Ndjson => process_file_ndjson(path.clone(), symbol_names.clone(), metrics.clone(), depth).await?,
